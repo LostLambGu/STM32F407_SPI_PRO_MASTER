@@ -133,7 +133,7 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  DebugLog("Spi protocol start!");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -142,7 +142,7 @@ int main(void)
   {
 
   /* USER CODE END WHILE */
-
+    BLESpiTick();
   /* USER CODE BEGIN 3 */
 
   }
@@ -401,7 +401,7 @@ failed:
 
   if (result < 0)
   {
-      DebugLog("====>>>> SPI_Read_Bridge fail before");
+      DebugLog("====>>>> SPI_Read_Bridge fail");
       spi_irq_flag = 0;
       spi_bus_halt = 1;
   }
@@ -483,6 +483,7 @@ failed:
 
   if (result < 0)
   {
+    DebugLog("====>>>> SPI_Write_Bridge fail");
     spi_irq_flag = 0;
     spi_bus_halt = 1;
   }
