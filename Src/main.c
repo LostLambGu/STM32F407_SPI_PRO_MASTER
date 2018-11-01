@@ -44,7 +44,42 @@
 #include "gpio.h"
 
 /* USER CODE BEGIN Includes */
+#include "stdarg.h"
+#include "stdio.h"
+#include "string.h"
 
+#define MAX_PRINTF_STR_SIZE (254)
+int32_t SerialDbgPrintf(uint8_t type, char *fmt, ...)
+{
+	if (type == 1)
+	{
+		int32_t cnt;
+		char string[MAX_PRINTF_STR_SIZE + 2] = {'\0'};
+		va_list ap;
+		va_start(ap, fmt);
+
+		cnt = vsnprintf(string, MAX_PRINTF_STR_SIZE, fmt, ap);
+		if (cnt > 0)
+		{
+			if (cnt < MAX_PRINTF_STR_SIZE)
+			{
+				HAL_UART_Transmit(&huart1, (uint8_t *)string, cnt, 50);
+			}
+			else
+			{
+        HAL_UART_Transmit(&huart1, (uint8_t *)string, MAX_PRINTF_STR_SIZE, 50);
+			}
+		}
+		va_end(ap);
+		return (cnt);
+	}
+	return -1;
+}
+
+#define DebugLog(format, ...) SerialDbgPrintf(1, "\r\n" format, ##__VA_ARGS__)
+#define DebugPrint(format, ...) SerialDbgPrintf(1, format, ##__VA_ARGS__)
+
+void BLESpiTick(void);
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -185,6 +220,7 @@ void SystemClock_Config(void)
 void _Error_Handler(char *file, int line)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
+  DebugLog("_Error_Handler: (%s) (%d)", file, line);
   /* User can add his own implementation to report the HAL error return state */
   while(1)
   {
@@ -203,11 +239,309 @@ void _Error_Handler(char *file, int line)
 void assert_failed(uint8_t* file, uint32_t line)
 { 
   /* USER CODE BEGIN 6 */
+  DebugLog("assert_failed: (%s) (%d)", file, line);
   /* User can add his own implementation to report the file name and line number,
      tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
+#define SPI_MAX_ITEM_SIZE (128 *3)
+#define SPI_BUFFER_SIZE (SPI_MAX_ITEM_SIZE + 4)
+
+#define WIFI_SPI_HEADER_LEN  (uint8_t)(6)
+#define WSHC_LOW_B (4) // WIFI SPI HEADER CRC16 LOW BYTE
+#define WSHC_HIGH_B (5) // WIFI SPI HEADER CRC16 HIGH BYTE
+#define WIFI_SPI_CTRL_WRITE  (uint8_t)(0x02)
+#define WIFI_SPI_CTRL_READ   (uint8_t)(0x03)
+
+#define WIFI_SPI_IRQ_PIN_READ() HAL_GPIO_ReadPin(PF4_SPI_IRQ_GPIO_Port, PF4_SPI_IRQ_Pin)
+#define WIFI_SPI_CS_SET_LOW() HAL_GPIO_WritePin(PF3_SPI_CS_GPIO_Port, PF3_SPI_CS_Pin, GPIO_PIN_RESET)
+#define WIFI_SPI_CS_SET_HIGH() HAL_GPIO_WritePin(PF3_SPI_CS_GPIO_Port, PF3_SPI_CS_Pin, GPIO_PIN_SET)
+
+#define WIFI_SPI_HANDLE hspi1
+
+volatile uint8_t spi_irq_flag = 0;
+volatile uint8_t spi_bus_halt = 0;
+static uint8_t SpiRxBuffer[SPI_BUFFER_SIZE];            /**< RX buffer. */
+static uint8_t SpiTxBuffer[SPI_BUFFER_SIZE];            /**< TX buffer. */
+static uint16_t SpiTxSize = 0;
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == GPIO_PIN_4)
+  {
+    spi_irq_flag = 1;
+    spi_bus_halt = 0;
+  }
+}
+
+int16_t SPI_Read_Bridge(void);
+int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes);
+uint16_t Cal_CRC16(const uint8_t *data, uint32_t size);
+
+void BLESpiTick(void)
+{
+  if (spi_bus_halt == 0)
+  {
+    if (spi_irq_flag == 1)
+    {
+      spi_irq_flag = 0;
+      SPI_Read_Bridge();
+    }
+
+    if (SpiTxSize)
+    {
+      SPI_Write_Bridge((uint8_t *)SpiTxBuffer, SpiTxSize);
+    }
+  }
+}
+
+int16_t SPI_Read_Bridge(void)
+{  
+  int16_t result = -1;
+  uint16_t byte_count = 0;
+  uint16_t wait_count = 0;
+  uint16_t crc16 = 0;
+  
+  uint8_t header_master[WIFI_SPI_HEADER_LEN] = {WIFI_SPI_CTRL_READ, 0x00, 0x00, 0x00, 0x00, 0x00};
+  uint8_t header_slave[WIFI_SPI_HEADER_LEN]  = {0x00};
+  
+  uint16_t i = 0;
+  
+  if(WIFI_SPI_IRQ_PIN_READ() == GPIO_PIN_RESET) {
+    DebugLog("SPI_Read_Bridge IRQ pin state err");
+    result = -2;
+    goto failed;
+  }
+
+  DebugLog("SPI_Read_Bridge IRQPin(%d)", WIFI_SPI_IRQ_PIN_READ());
+
+  memset(SpiRxBuffer, 0, sizeof(SpiRxBuffer));
+  
+  WIFI_SPI_CS_SET_LOW();
+  if (HAL_SPI_TransmitReceive(&WIFI_SPI_HANDLE, header_master, header_slave, WIFI_SPI_HEADER_LEN, 150))
+  {
+    DebugLog("SPI_Read_Bridge Header transfer err");
+    result = -3;
+    goto failed;
+  }
+
+  crc16 = Cal_CRC16(header_slave + 2, 2);
+  if (crc16 != (((uint16_t)header_slave[5])<<8 | (uint16_t)header_slave[4]))
+  {
+    DebugLog("SPI_Read_Bridge header_slave crc err");
+    result = -4;
+    goto failed;
+  }
+
+  byte_count = ((uint16_t)header_slave[3])<<8 | (uint16_t)header_slave[2];
+  if (byte_count == 0)
+  {
+    DebugLog("SPI_Read_Bridge receive byte_count 0");
+    result = -5;
+    goto failed;
+  }
+  else if (byte_count > SPI_MAX_ITEM_SIZE)
+  {
+    DebugLog("SPI_Read_Bridge receive byte_count %d > max(%d)", byte_count, SPI_MAX_ITEM_SIZE);
+    result = -6;
+    goto failed;
+  }
+  else
+  {
+    DebugLog("SPI_Read_Bridge byte_count: %d", byte_count);
+  }
+
+  DebugLog("SPI_Read_Bridge Wait IRQPin Low");
+  while (WIFI_SPI_IRQ_PIN_READ() != GPIO_PIN_RESET)
+  {
+    HAL_Delay(1); // Delay 10 ms
+    wait_count++;
+    if (wait_count == 50)
+    {
+      DebugLog("SPI_Read_Bridge Wait IRQPin Low Timeout");
+      result = -8;
+      goto failed;
+    }
+  }
+
+  if (byte_count > 0) 
+  {
+    DebugLog("SPI_Read_Bridge receive data size(%d)", byte_count);
+    if (HAL_SPI_Receive(&WIFI_SPI_HANDLE, SpiRxBuffer, byte_count, 1000))
+    {
+      DebugLog("SPI_Read_Bridge receive data err");
+      result = -9;
+      goto failed;
+    }
+
+    crc16 = Cal_CRC16(SpiRxBuffer, byte_count - 2);
+    if (crc16 != (((uint16_t)SpiRxBuffer[byte_count - 1])<<8 | (uint16_t)SpiRxBuffer[byte_count - 2]))
+    {
+      DebugLog("SPI_Read_Bridge read data crc err");
+      result = -10;
+      goto failed;
+    }
+  }
+  result = byte_count;
+
+  DebugLog("SPI_Read_Bridge received data\r\n");
+  for (i = 0; i < byte_count; i++)
+  {
+    DebugPrint("0x%x ", SpiRxBuffer[i]);
+  }
+  DebugPrint("\r\n");
+  
+failed:
+  if(spi_irq_flag == 1)
+  {
+    DebugLog("SPI_Read_Bridge spi_irq_flag pending");
+  }
+
+  if (result < 0)
+  {
+      DebugLog("====>>>> SPI_Read_Bridge fail before");
+      spi_irq_flag = 0;
+      spi_bus_halt = 1;
+  }
+
+  WIFI_SPI_CS_SET_HIGH();
+  
+  return result;
+}
+
+int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
+{  
+  int16_t result = -1;
+  uint32_t wait_count = 0;
+  uint16_t crc16 = 0;
+  
+  uint8_t header_master[WIFI_SPI_HEADER_LEN] = {WIFI_SPI_CTRL_WRITE, 0x00, 0x00, 0x00, 0x00, 0x00};
+  uint8_t header_slave[WIFI_SPI_HEADER_LEN]  = {0x00};
+
+  header_master[2] = (uint8_t)Nb_bytes;
+  header_master[3] = (uint8_t)(Nb_bytes>>8);
+
+  crc16 = Cal_CRC16(header_master, 5);
+  header_master[4] = (uint8_t)crc16;
+  header_master[5] = (uint8_t)(crc16>>8);
+  
+  WIFI_SPI_CS_SET_LOW();
+  
+  while ((WIFI_SPI_IRQ_PIN_READ() == GPIO_PIN_RESET) || (spi_irq_flag == 0)) {
+    HAL_Delay(1);
+    wait_count++;
+    if (wait_count == 1000)
+    {
+      DebugLog("SPI_Write_Bridge Wait IRQPin High Timeout");
+      result = -2;
+      goto failed;
+    }
+  }
+
+  DebugLog("SPI_Write_Bridge IRQPin(%d)", WIFI_SPI_IRQ_PIN_READ());
+
+  if (HAL_SPI_TransmitReceive(&WIFI_SPI_HANDLE, header_master, header_slave, WIFI_SPI_HEADER_LEN, 150))
+  {
+    DebugLog("SPI_Write_Bridge Header transfer err");
+    result = -3;
+    goto failed;
+  }
+
+  spi_irq_flag = 0;
+
+  DebugLog("SPI_Write_Bridge Wait IRQPin Low");
+  wait_count = 0;
+  while (WIFI_SPI_IRQ_PIN_READ() != GPIO_PIN_RESET)
+  {
+    HAL_Delay(1);
+    wait_count++;
+    if (wait_count == 50)
+    {
+      DebugLog("SPI_Write_Bridge Wait IRQPin Low Timeout");
+      result = -7;
+      goto failed;
+    }
+  }
+  
+  if (HAL_SPI_Transmit(&WIFI_SPI_HANDLE, data, Nb_bytes, 1000))
+  {
+    DebugLog("SPI_Write_Bridge data transfer err");
+    result = -8;
+    goto failed;
+  }
+  
+  result = Nb_bytes;
+
+failed:
+
+  if(spi_irq_flag == 1)
+  {
+    DebugLog("SPI_Write_Bridge spi_irq_flag pending");
+  }
+
+  if (result < 0)
+  {
+    spi_irq_flag = 0;
+    spi_bus_halt = 1;
+  }
+  
+  WIFI_SPI_CS_SET_HIGH();
+
+  return result;
+}
+
+/**
+  * @brief  Update CRC 16 for input byte
+  * @param  CRC input value 
+  * @param  input byte
+  * @retval Updated CRC value
+  */
+static uint16_t UpdateCRC16(uint16_t crcIn, uint8_t byte)
+{
+  uint32_t crc = crcIn;
+  uint32_t in = byte | 0x100;
+
+  do
+  {
+    crc <<= 1;
+    in <<= 1;
+
+    if (in & 0x100)
+    {
+      ++crc;
+    }
+
+    if (crc & 0x10000)
+    {
+      crc ^= 0x1021;
+    }
+  } while (!(in & 0x10000));
+
+  return (crc & 0xffffu);
+}
+
+/**
+  * @brief  Cal CRC 16 for YModem Packet
+  * @param  data
+  * @param  length
+  * @retval CRC value
+  */
+uint16_t Cal_CRC16(const uint8_t *data, uint32_t size)
+{
+  uint32_t crc = 0;
+  const uint8_t *dataEnd = data + size;
+
+  while (data < dataEnd)
+  {
+    crc = UpdateCRC16(crc, *data++);
+  }
+  crc = UpdateCRC16(crc, 0);
+  crc = UpdateCRC16(crc, 0);
+
+  return (crc & 0xffffu);
+}
 
 /**
   * @}
