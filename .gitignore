@@ -1,0 +1,7 @@
+EWARM/SPI_TEST_MASTER/*
+.vscode/*
+*/*.bak
+.tags
+GPATH
+GRTAGS
+GTAGS
