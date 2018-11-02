@@ -254,6 +254,7 @@ void assert_failed(uint8_t* file, uint32_t line)
 #define WSHC_HIGH_B (5) // WIFI SPI HEADER CRC16 HIGH BYTE
 #define WIFI_SPI_CTRL_WRITE  (uint8_t)(0x02)
 #define WIFI_SPI_CTRL_READ   (uint8_t)(0x03)
+#define WIFI_SPI_RSP_MASK (0x8000)
 
 #define WIFI_SPI_IRQ_PIN_READ() HAL_GPIO_ReadPin(PF4_SPI_IRQ_GPIO_Port, PF4_SPI_IRQ_Pin)
 #define WIFI_SPI_CS_SET_LOW() HAL_GPIO_WritePin(PF3_SPI_CS_GPIO_Port, PF3_SPI_CS_Pin, GPIO_PIN_RESET)
@@ -266,6 +267,8 @@ volatile uint8_t spi_bus_halt = 0;
 static uint8_t SpiRxBuffer[SPI_BUFFER_SIZE];            /**< RX buffer. */
 static uint8_t SpiTxBuffer[SPI_BUFFER_SIZE];            /**< TX buffer. */
 static uint16_t SpiTxSize = 0;
+static uint16_t cmdRec = 0;
+static uint16_t lenRec = 0;
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -290,9 +293,17 @@ void BLESpiTick(void)
       SPI_Read_Bridge();
     }
 
+    HAL_Delay(10);
+
     if (SpiTxSize)
     {
+      *((uint16_t *)SpiTxBuffer) = SpiTxSize;
+      *((uint16_t *)(SpiTxBuffer + 2)) = cmdRec | WIFI_SPI_RSP_MASK;
+      *((uint16_t *)(SpiTxBuffer + 4)) = lenRec;
+      *((uint16_t *)(SpiTxBuffer + 6)) = Cal_CRC16(SpiTxBuffer, 6);
       SPI_Write_Bridge((uint8_t *)SpiTxBuffer, SpiTxSize);
+      SpiTxSize = 0;
+      memset(SpiTxBuffer, 0, sizeof(SpiTxBuffer));
     }
   }
 }
@@ -386,6 +397,11 @@ int16_t SPI_Read_Bridge(void)
   }
   result = byte_count;
 
+  lenRec = *((uint16_t *)SpiRxBuffer);
+  cmdRec = *((uint16_t *)(SpiRxBuffer + 2));
+  SpiTxSize = 8;
+  DebugLog("SPI_Read_Bridge lenRec(%d) cmdRec(%d)\r\n", lenRec, cmdRec);
+
   DebugLog("SPI_Read_Bridge received data\r\n");
   for (i = 0; i < byte_count; i++)
   {
@@ -419,11 +435,12 @@ int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
   
   uint8_t header_master[WIFI_SPI_HEADER_LEN] = {WIFI_SPI_CTRL_WRITE, 0x00, 0x00, 0x00, 0x00, 0x00};
   uint8_t header_slave[WIFI_SPI_HEADER_LEN]  = {0x00};
+  uint16_t i = 0;
 
   header_master[2] = (uint8_t)Nb_bytes;
   header_master[3] = (uint8_t)(Nb_bytes>>8);
 
-  crc16 = Cal_CRC16(header_master, 5);
+  crc16 = Cal_CRC16(header_master + 2, 2);
   header_master[4] = (uint8_t)crc16;
   header_master[5] = (uint8_t)(crc16>>8);
   
@@ -465,6 +482,12 @@ int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
     }
   }
   
+  DebugLog("SPI_Write_Bridge transfer dataLen(%d):\r\n", Nb_bytes);
+  for (i = 0; i < Nb_bytes; i++)
+  {
+    DebugPrint("0x%x ", data[i]);
+  }
+  DebugPrint("\r\n");
   if (HAL_SPI_Transmit(&WIFI_SPI_HANDLE, data, Nb_bytes, 1000))
   {
     DebugLog("SPI_Write_Bridge data transfer err");
