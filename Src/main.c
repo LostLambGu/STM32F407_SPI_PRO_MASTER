@@ -293,7 +293,7 @@ void BLESpiTick(void)
       SPI_Read_Bridge();
     }
 
-    HAL_Delay(10);
+    HAL_Delay(5);
 
     if (SpiTxSize)
     {
@@ -444,6 +444,7 @@ int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
   header_master[4] = (uint8_t)crc16;
   header_master[5] = (uint8_t)(crc16>>8);
   
+  DebugLog("SPI_Write_Bridge Set CS Low");
   WIFI_SPI_CS_SET_LOW();
   
   while ((WIFI_SPI_IRQ_PIN_READ() == GPIO_PIN_RESET) || (spi_irq_flag == 0)) {
