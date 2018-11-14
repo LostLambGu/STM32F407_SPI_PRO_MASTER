@@ -39,6 +39,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f4xx_hal.h"
+#include "dma.h"
 #include "spi.h"
 #include "usart.h"
 #include "gpio.h"
@@ -130,6 +131,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -270,12 +272,37 @@ static uint16_t SpiTxSize = 0;
 static uint16_t cmdRec = 0;
 static uint16_t lenRec = 0;
 
+volatile uint8_t spiCpl = 0;
+volatile uint8_t spiErr = 0;
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == GPIO_PIN_4)
   {
     spi_irq_flag = 1;
     spi_bus_halt = 0;
+  }
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  if (&WIFI_SPI_HANDLE == hspi)
+  {
+    spiCpl = 1;
+  }
+}
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  if (&WIFI_SPI_HANDLE == hspi)
+  {
+    spiCpl = 1;
+  }
+}
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+  if (&WIFI_SPI_HANDLE == hspi)
+  {
+    spiErr = 1;
   }
 }
 
@@ -319,6 +346,8 @@ int16_t SPI_Read_Bridge(void)
   uint8_t header_slave[WIFI_SPI_HEADER_LEN]  = {0x00};
   
   uint16_t i = 0;
+
+  uint32_t sysTickRec = 0;
   
   if(WIFI_SPI_IRQ_PIN_READ() == GPIO_PIN_RESET) {
     DebugLog("SPI_Read_Bridge IRQ pin state err");
@@ -331,12 +360,35 @@ int16_t SPI_Read_Bridge(void)
   memset(SpiRxBuffer, 0, sizeof(SpiRxBuffer));
   
   WIFI_SPI_CS_SET_LOW();
-  if (HAL_SPI_TransmitReceive(&WIFI_SPI_HANDLE, header_master, header_slave, WIFI_SPI_HEADER_LEN, 150))
+  if (HAL_SPI_TransmitReceive_DMA(&WIFI_SPI_HANDLE, header_master, header_slave, WIFI_SPI_HEADER_LEN))
   {
     DebugLog("SPI_Read_Bridge Header transfer err");
     result = -3;
     goto failed;
   }
+
+  sysTickRec = HAL_GetTick();
+
+  while (spiCpl == 0)
+  {
+    if (((HAL_GetTick() - sysTickRec) > 150) || (spiErr != 0))
+    {
+      if (spiErr != 0)
+      {
+        DebugLog("SPI_Read_Bridge Header transfer dma err");
+        result = -3;
+        goto failed;
+      }
+      else
+      {
+        DebugLog("SPI_Read_Bridge Header transfer timeout");
+        result = -3;
+        goto failed;
+      }
+    }
+  }
+
+  spiCpl = 0;
 
   crc16 = Cal_CRC16(header_slave + 2, 2);
   if (crc16 != (((uint16_t)header_slave[5])<<8 | (uint16_t)header_slave[4]))
@@ -380,12 +432,35 @@ int16_t SPI_Read_Bridge(void)
   if (byte_count > 0) 
   {
     DebugLog("SPI_Read_Bridge receive data size(%d)", byte_count);
-    if (HAL_SPI_Receive(&WIFI_SPI_HANDLE, SpiRxBuffer, byte_count, 1000))
+    if (HAL_SPI_TransmitReceive_DMA(&WIFI_SPI_HANDLE, SpiRxBuffer, SpiRxBuffer, byte_count))
     {
       DebugLog("SPI_Read_Bridge receive data err");
       result = -9;
       goto failed;
     }
+
+    sysTickRec = HAL_GetTick();
+
+    while (spiCpl == 0)
+    {
+      if (((HAL_GetTick() - sysTickRec) > 1000) || (spiErr != 0))
+      {
+        if (spiErr != 0)
+        {
+          DebugLog("SPI_Read_Bridge data transfer dma err");
+          result = -9;
+          goto failed;
+        }
+        else
+        {
+          DebugLog("SPI_Read_Bridge data transfer timeout");
+          result = -9;
+          goto failed;
+        }
+      }
+    }
+
+    spiCpl = 0;
 
     crc16 = Cal_CRC16(SpiRxBuffer, byte_count - 2);
     if (crc16 != (((uint16_t)SpiRxBuffer[byte_count - 1])<<8 | (uint16_t)SpiRxBuffer[byte_count - 2]))
@@ -422,6 +497,8 @@ failed:
       spi_bus_halt = 1;
   }
 
+  spiErr = 0;
+
   WIFI_SPI_CS_SET_HIGH();
   
   return result;
@@ -436,6 +513,8 @@ int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
   uint8_t header_master[WIFI_SPI_HEADER_LEN] = {WIFI_SPI_CTRL_WRITE, 0x00, 0x00, 0x00, 0x00, 0x00};
   uint8_t header_slave[WIFI_SPI_HEADER_LEN]  = {0x00};
   uint16_t i = 0;
+
+  uint32_t sysTickRec = 0;
 
   header_master[2] = (uint8_t)Nb_bytes;
   header_master[3] = (uint8_t)(Nb_bytes>>8);
@@ -460,13 +539,35 @@ int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
 
   DebugLog("SPI_Write_Bridge IRQPin(%d)", WIFI_SPI_IRQ_PIN_READ());
 
-  if (HAL_SPI_TransmitReceive(&WIFI_SPI_HANDLE, header_master, header_slave, WIFI_SPI_HEADER_LEN, 150))
+  if (HAL_SPI_TransmitReceive_DMA(&WIFI_SPI_HANDLE, header_master, header_slave, WIFI_SPI_HEADER_LEN))
   {
     DebugLog("SPI_Write_Bridge Header transfer err");
     result = -3;
     goto failed;
   }
 
+  sysTickRec = HAL_GetTick();
+
+  while (spiCpl == 0)
+  {
+    if (((HAL_GetTick() - sysTickRec) > 150) || (spiErr != 0))
+    {
+      if (spiErr != 0)
+      {
+        DebugLog("SPI_Write_Bridge Header transfer dma err");
+        result = -3;
+        goto failed;
+      }
+      else
+      {
+        DebugLog("SPI_Write_Bridge Header transfer timeout");
+        result = -3;
+        goto failed;
+      }
+    }
+  }
+
+  spiCpl = 0;
   spi_irq_flag = 0;
 
   DebugLog("SPI_Write_Bridge Wait IRQPin Low");
@@ -489,13 +590,35 @@ int16_t SPI_Write_Bridge(uint8_t* data, uint16_t Nb_bytes)
     DebugPrint("0x%x ", data[i]);
   }
   DebugPrint("\r\n");
-  if (HAL_SPI_Transmit(&WIFI_SPI_HANDLE, data, Nb_bytes, 1000))
+  if (HAL_SPI_TransmitReceive_DMA(&WIFI_SPI_HANDLE, data, data, Nb_bytes))
   {
     DebugLog("SPI_Write_Bridge data transfer err");
     result = -8;
     goto failed;
   }
-  
+
+  sysTickRec = HAL_GetTick();
+
+  while (spiCpl == 0)
+  {
+    if (((HAL_GetTick() - sysTickRec) > 1000) || (spiErr != 0))
+    {
+      if (spiErr != 0)
+      {
+        DebugLog("SPI_Write_Bridge data transfer dma err");
+        result = -8;
+        goto failed;
+      }
+      else
+      {
+        DebugLog("SPI_Write_Bridge data transfer timeout");
+        result = -8;
+        goto failed;
+      }
+    }
+  }
+
+  spiCpl = 0;
   result = Nb_bytes;
 
 failed:
@@ -511,6 +634,8 @@ failed:
     spi_irq_flag = 0;
     spi_bus_halt = 1;
   }
+
+  spiErr = 0;
   
   WIFI_SPI_CS_SET_HIGH();
 

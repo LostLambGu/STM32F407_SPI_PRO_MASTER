@@ -1002,7 +1002,7 @@
                 </option>
                 <option>
                     <name>IlinkTrustzoneImportLibraryOut</name>
-                    <state>###Unitialized###</state>
+                    <state>SPI_TEST_MASTER_import_lib.o</state>
                 </option>
             </data>
         </settings>
@@ -1043,6 +1043,9 @@
         </group>
         <group>
             <name>User</name>
+            <file>
+                <name>$PROJ_DIR$\..\Src\dma.c</name>
+            </file>
             <file>
                 <name>$PROJ_DIR$\..\Src\gpio.c</name>
             </file>
